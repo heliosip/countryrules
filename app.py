@@ -1,7 +1,8 @@
 import streamlit as st
 import pandas as pd
 import pyodbc
-from datetime import datetime
+from datetime import datetime, timedelta
+import re
 
 # Initialize session state
 if 'authenticated' not in st.session_state:
@@ -24,6 +25,61 @@ def get_db_connection(username, password, database):
         f"Connection Timeout=30;"
     )
     return pyodbc.connect(conn_str)
+
+def calculate_date(trigger_date, formula):
+    if not formula or not isinstance(formula, str):
+        return None
+    
+    # Standardize formula text
+    formula = formula.strip().lower()
+    
+    # Extract number and unit from formula
+    pattern = r'add (\d+) (\w+)'
+    match = re.search(pattern, formula)
+    
+    if not match:
+        return None
+        
+    number = int(match.group(1))
+    unit = match.group(2).rstrip('s')  # Remove potential plural
+    
+    if unit == 'month':
+        # Handle month addition considering end of month cases
+        new_month = trigger_date.month + number
+        new_year = trigger_date.year + (new_month - 1) // 12
+        new_month = ((new_month - 1) % 12) + 1
+        
+        # Try to maintain the same day, but adjust for end of month cases
+        max_day = (trigger_date.replace(year=new_year, month=new_month + 1, day=1) - timedelta(days=1)).day
+        new_day = min(trigger_date.day, max_day)
+        
+        return trigger_date.replace(year=new_year, month=new_month, day=new_day)
+    elif unit == 'day':
+        return trigger_date + timedelta(days=number)
+    elif unit == 'week':
+        return trigger_date + timedelta(weeks=number)
+    
+    return None
+
+def get_calculated_rule_data(conn, rule_id=None, trigger_date=None):
+    results_df = pd.read_sql("EXEC dbo.RuleHierarchyReport", conn)
+    
+    if rule_id:
+        family_refs = get_family_references(results_df, rule_id=rule_id)
+        results_df = results_df[results_df['FamilyReference'].isin(family_refs)]
+    
+    if trigger_date:
+        # Convert trigger_date to datetime if it's not already
+        if isinstance(trigger_date, str):
+            trigger_date = pd.to_datetime(trigger_date).date()
+            
+        # Apply date calculations and store results in new columns
+        results_df['Calculated_Due_Date'] = results_df['DueDate'].apply(
+            lambda x: calculate_date(trigger_date, x) if pd.notnull(x) else None)
+        results_df['Calculated_Final_Due_Date'] = results_df['FinalDueDate'].apply(
+            lambda x: calculate_date(trigger_date, x) if pd.notnull(x) else None)
+    
+    return results_df
 
 def get_dashboard_metrics_triggers(filtered_df):
     return pd.DataFrame([{
@@ -81,7 +137,6 @@ def get_filtered_options(conn, jurisdiction=None, matter_type=None):
     {where_clause}
     """
     return pd.read_sql(query, conn)
-
 def get_release_notes_data(conn, jurisdiction=None, matter_type=None, from_date=None, to_date=None):
     conditions = []
     if jurisdiction and jurisdiction != 'All':
@@ -137,6 +192,21 @@ def get_family_references(df, rule_id=None, rule_name=None, outcome=None):
         return df[df['Outcome'].str.contains(outcome, case=False, na=False)]['FamilyReference'].unique()
     return []
 
+def get_calculated_rule_data(conn, rule_id=None, trigger_date=None):
+    results_df = pd.read_sql("EXEC dbo.RuleHierarchyReport", conn)
+    
+    if rule_id:
+        family_refs = get_family_references(results_df, rule_id=rule_id)
+        results_df = results_df[results_df['FamilyReference'].isin(family_refs)]
+    
+    if trigger_date:
+        results_df['Calculated_Due_Date'] = results_df['DueDate'].apply(
+            lambda x: calculate_date(trigger_date, x))
+        results_df['Calculated_Final_Due_Date'] = results_df['FinalDueDate'].apply(
+            lambda x: calculate_date(trigger_date, x))
+    
+    return results_df
+
 def main():
     css = '''
         <style>
@@ -169,7 +239,6 @@ def main():
             if st.button("Login", key="login_button"):
                 try:
                     conn = get_db_connection(username, password, database)
-                    # Test connection with simple query
                     test_df = pd.read_sql("SELECT 1", conn)
                     conn.close()
                     st.session_state['authenticated'] = True
@@ -185,7 +254,7 @@ def main():
             st.header("Reports")
             report_type = st.selectbox(
                 "Select Report",
-                options=["What Triggers What", "Release Notes"],
+                options=["What Triggers What", "Release Notes", "Calculate Rule"],
                 key="report_select"
             )
             
@@ -218,7 +287,7 @@ def main():
                     key="matter_type_select"
                 )
                 
-                if report_type == "What Triggers What":
+                if report_type in ["What Triggers What", "Calculate Rule"]:
                     filtered_options = get_filtered_options(conn, jurisdiction, matter_type)
                     
                     rule = st.selectbox(
@@ -227,11 +296,18 @@ def main():
                         key="rule_select"
                     )
                     
-                    outcomes = st.selectbox(
-                        "Search Outcomes",
-                        options=[''] + list(sorted(filtered_options['Outcome'].dropna().unique())),
-                        key="outcome_select"
-                    )
+                    if report_type == "What Triggers What":
+                        outcomes = st.selectbox(
+                            "Search Outcomes",
+                            options=[''] + list(sorted(filtered_options['Outcome'].dropna().unique())),
+                            key="outcome_select"
+                        )
+                    else:  # Calculate Rule
+                        trigger_date = st.date_input(
+                            "Trigger Date",
+                            value=datetime.now().date(),
+                            key="trigger_date"
+                        )
                 else:  # Release Notes
                     from_date = st.date_input("From Date", key="from_date")
                     to_date = st.date_input("To Date", key="to_date")
@@ -297,6 +373,58 @@ def main():
                             'MatterType', 'Jurisdictions', 'TriggeredBy', 'TriggerCondition',
                             'Output Type', 'Outcome', 'DueDate', 'FinalDueDate'
                         ]],
+                        hide_index=True,
+                        use_container_width=True,
+                        height=600
+                    )
+            
+            elif report_type == "Calculate Rule":
+                rule_id = rule.split(']')[0][1:] if rule else None
+                filtered_df = get_calculated_rule_data(conn, rule_id, trigger_date)
+                
+                if jurisdiction and jurisdiction != 'All':
+                    filtered_df = filtered_df[filtered_df['Jurisdictions'].str.contains(
+                        jurisdiction, case=False, na=False)]
+                if matter_type:
+                    filtered_df = filtered_df[filtered_df['MatterType'].str.contains(
+                        matter_type, case=False, na=False)]
+                
+                if filtered_df.empty:
+                    st.write("No results found.")
+                else:
+                    def truncate_text(text, max_length=30):
+                        return text[:max_length] + '...' if len(text) > max_length else text
+                    
+                    dashboard_df = get_dashboard_metrics_triggers(filtered_df)
+                    
+                    cols = st.columns([3, 1, 1, 1, 1])
+                    cols[0].metric("Jurisdictions", 
+                        truncate_text(dashboard_df['Jurisdictions'].iloc[0], max_length=50))
+                    cols[1].metric("Matter Types", 
+                        truncate_text(dashboard_df['MatterTypes'].iloc[0]))
+                    cols[2].metric("Actions", int(dashboard_df['Actions'].iloc[0]))
+                    cols[3].metric("Tasks", int(dashboard_df['Tasks'].iloc[0]))
+
+                    st.markdown('<div class="spacer"></div>', unsafe_allow_html=True)
+                    
+# Create display dataframe with base date column
+                    display_df = filtered_df[[
+                        'FamilyReference', 'RuleID', 'RuleType', 'RuleName',
+                        'Output Type', 'Outcome'
+                    ]].copy()
+                    
+                    # Add Base Date before calculated dates
+                    display_df['Base Date'] = trigger_date.strftime('%Y-%m-%d')
+                    display_df['Calculated_Due_Date'] = filtered_df['Calculated_Due_Date']
+                    display_df['Calculated_Final_Due_Date'] = filtered_df['Calculated_Final_Due_Date']
+                    
+                    # Format dates for display
+                    for date_col in ['Calculated_Due_Date', 'Calculated_Final_Due_Date']:
+                        display_df[date_col] = pd.to_datetime(
+                            display_df[date_col]).dt.strftime('%Y-%m-%d')
+                        
+                    st.dataframe(
+                        display_df,
                         hide_index=True,
                         use_container_width=True,
                         height=600
