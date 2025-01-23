@@ -1,23 +1,45 @@
 import streamlit as st
 import pandas as pd
 import pyodbc
+from datetime import datetime
+
+# Initialize session state
+if 'authenticated' not in st.session_state:
+    st.session_state['authenticated'] = False
+    st.session_state['username'] = None
+    st.session_state['password'] = None
+    st.session_state['database'] = None
 
 st.set_page_config(page_title="IP Rule Family Analyzer", layout="wide", initial_sidebar_state="expanded")
 
-def get_db_connection(username, password):
-    return pyodbc.connect(
-        "Driver={ODBC Driver 17 for SQL Server};"
-        "Server=tcp:lumenip.database.windows.net,1433;"
-        f"Database=lumenip-IPRulesEngineQA1;Uid={username}@lumenip;Pwd={password};"
-        "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
+def get_db_connection(username, password, database):
+    conn_str = (
+        f"Driver={{ODBC Driver 17 for SQL Server}};"
+        f"Server=tcp:lumenip.database.windows.net,1433;"
+        f"Database={database};"
+        f"Uid={username}@lumenip;"
+        f"Pwd={password};"
+        f"Encrypt=yes;"
+        f"TrustServerCertificate=no;"
+        f"Connection Timeout=30;"
     )
+    return pyodbc.connect(conn_str)
 
-def get_dashboard_metrics(filtered_df):
+def get_dashboard_metrics_triggers(filtered_df):
     return pd.DataFrame([{
         'Jurisdictions': ', '.join(sorted(set([j.strip() for j in filtered_df['Jurisdictions'].str.split(',').explode().str.strip()]))),
         'MatterTypes': ', '.join(sorted(set([m.strip() for m in filtered_df['MatterType'].str.split(',').explode().str.strip()]))),
         'Actions': len(filtered_df[filtered_df['RuleType'] == 'Action']),
         'Tasks': len(filtered_df[filtered_df['RuleType'] == 'Task'])
+    }])
+
+def get_dashboard_metrics_release(filtered_df, from_date, to_date):
+    return pd.DataFrame([{
+        'Jurisdictions': ', '.join(sorted(set([j.strip() for j in filtered_df['Country'].str.split(',').explode().str.strip()]))),
+        'From': from_date.strftime('%Y-%m-%d'),
+        'To': to_date.strftime('%Y-%m-%d'),
+        'Actions': len(filtered_df[filtered_df['Rule Type'] == 'Action']),
+        'Tasks': len(filtered_df[filtered_df['Rule Type'] == 'Task'])
     }])
 
 def get_jurisdictions(conn):
@@ -60,6 +82,52 @@ def get_filtered_options(conn, jurisdiction=None, matter_type=None):
     """
     return pd.read_sql(query, conn)
 
+def get_release_notes_data(conn, jurisdiction=None, matter_type=None, from_date=None, to_date=None):
+    conditions = []
+    if jurisdiction and jurisdiction != 'All':
+        conditions.append(f"c.Name = '{jurisdiction}'")
+    if matter_type:
+        conditions.append(f"m.MaterType = '{matter_type}'")
+    if from_date:
+        conditions.append(f"rd.ModifiedOn >= '{from_date}'")
+    if to_date:
+        conditions.append(f"rd.ModifiedOn <= '{to_date}'")
+    
+    where_clause = f"WHERE rd.Active = 1 {' AND ' + ' AND '.join(conditions) if conditions else ''}"
+    
+    query = f"""
+    SELECT DISTINCT
+        rd.ID as 'QA Rule ID',
+        rd.ProdId as 'Rule ID',
+        rd.Activity as 'Rule Name',
+        rt.RuleType as 'Rule Type',
+        STUFF((
+            SELECT DISTINCT ', ' + m2.MaterType
+            FROM dbo.SplitStrings(rd.MatterType, ',') mt2
+            JOIN tblMatterTypeMaster m2 ON RTRIM(LTRIM(mt2.Item)) = CAST(m2.ID AS VARCHAR)
+            FOR XML PATH(''), TYPE).value('.', 'varchar(max)'), 1, 2, '') as 'Matter Type',
+        STUFF((
+            SELECT DISTINCT ', ' + c2.Name
+            FROM dbo.SplitStrings(rd.Jurisdiction, ',') j2
+            JOIN tblCountryMaster c2 ON RTRIM(LTRIM(j2.Item)) = CAST(c2.ID AS VARCHAR)
+            FOR XML PATH(''), TYPE).value('.', 'varchar(max)'), 1, 2, '') as Country,
+        rd.versionType as 'Version Type',
+        rd.CalcCode as 'Calc Code',
+        rd.versionNotes as 'Version Notes',
+        rd.releaseVersion as 'Release Version',
+        rd.Reference as Reference,
+        rd.ModifiedOn as 'Modified On'
+    FROM tblRuleDefination rd
+    CROSS APPLY dbo.SplitStrings(rd.MatterType, ',') mt
+    CROSS APPLY dbo.SplitStrings(rd.Jurisdiction, ',') j
+    JOIN tblMatterTypeMaster m ON RTRIM(LTRIM(mt.Item)) = CAST(m.ID AS VARCHAR)
+    JOIN tblCountryMaster c ON RTRIM(LTRIM(j.Item)) = CAST(c.ID AS VARCHAR)
+    LEFT JOIN tblRuleTypeMaster rt ON rd.RuleType = rt.ID
+    {where_clause}
+    ORDER BY rd.ModifiedOn DESC
+    """
+    return pd.read_sql(query, conn)
+
 def get_family_references(df, rule_id=None, rule_name=None, outcome=None):
     if rule_id:
         return df[df['ChainPath'].apply(lambda x: str(rule_id) in x.split('->'))]['FamilyReference'].unique()
@@ -70,10 +138,10 @@ def get_family_references(df, rule_id=None, rule_name=None, outcome=None):
     return []
 
 def main():
-    st.markdown("""
+    css = '''
         <style>
-            .stMetric .metric-label { font-size: 0.8rem !important; }
-            .stMetric .metric-value { font-size: 1.8rem !important; }
+            .stMetric .metric-label { font-size: 12px !important; }
+            .stMetric .metric-value { font-size: 24px !important; }
             .logo-text { 
                 font-family: 'Arial Black', sans-serif; 
                 font-size: 2.5rem; 
@@ -84,23 +152,58 @@ def main():
             }
             .spacer { margin-bottom: 2rem; }
         </style>
-    """, unsafe_allow_html=True)
+    '''
+    st.markdown(css, unsafe_allow_html=True)
 
     with st.sidebar:
         st.markdown('<div class="logo-text">RightHub</div>', unsafe_allow_html=True)
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-
-    if username and password:
-        try:
-            conn = get_db_connection(username, password)
+        
+        if not st.session_state['authenticated']:
+            st.header("Login")
+            username = st.text_input("Username", key="username_input")
+            password = st.text_input("Password", type="password", key="password_input")
+            database = st.selectbox("Database", 
+                options=["lumenip-IPRulesEngineQA1", "IPRulesEngine"],
+                key="database_select")
             
-            with st.sidebar:
-                st.header("Search Filters")
+            if st.button("Login", key="login_button"):
+                try:
+                    conn = get_db_connection(username, password, database)
+                    # Test connection with simple query
+                    test_df = pd.read_sql("SELECT 1", conn)
+                    conn.close()
+                    st.session_state['authenticated'] = True
+                    st.session_state['username'] = username
+                    st.session_state['password'] = password
+                    st.session_state['database'] = database
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Login failed: {str(e)}")
+                    st.session_state['authenticated'] = False
+        
+        if st.session_state['authenticated']:
+            st.header("Reports")
+            report_type = st.selectbox(
+                "Select Report",
+                options=["What Triggers What", "Release Notes"],
+                key="report_select"
+            )
+            
+            st.header("Search Filters")
+            
+            try:
+                conn = get_db_connection(
+                    st.session_state['username'],
+                    st.session_state['password'],
+                    st.session_state['database']
+                )
                 
                 jurisdictions = get_jurisdictions(conn)
-                jurisdiction = st.selectbox("Jurisdiction", 
-                    options=['All'] + list(jurisdictions['Name']))
+                jurisdiction = st.selectbox(
+                    "Jurisdiction", 
+                    options=['All'] + list(jurisdictions['Name']),
+                    key="jurisdiction_select"
+                )
                 
                 matter_types = pd.read_sql("""
                     SELECT DISTINCT MaterType
@@ -109,25 +212,51 @@ def main():
                     ORDER BY MaterType
                 """, conn)
                 
-                matter_type = st.selectbox("Matter Type", 
-                    options=[''] + list(matter_types['MaterType']))
+                matter_type = st.selectbox(
+                    "Matter Type", 
+                    options=[''] + list(matter_types['MaterType']),
+                    key="matter_type_select"
+                )
                 
-                filtered_options = get_filtered_options(conn, jurisdiction, matter_type)
+                if report_type == "What Triggers What":
+                    filtered_options = get_filtered_options(conn, jurisdiction, matter_type)
+                    
+                    rule = st.selectbox(
+                        "Search Rules",
+                        options=[''] + list(sorted(filtered_options['DisplayName'].unique())),
+                        key="rule_select"
+                    )
+                    
+                    outcomes = st.selectbox(
+                        "Search Outcomes",
+                        options=[''] + list(sorted(filtered_options['Outcome'].dropna().unique())),
+                        key="outcome_select"
+                    )
+                else:  # Release Notes
+                    from_date = st.date_input("From Date", key="from_date")
+                    to_date = st.date_input("To Date", key="to_date")
                 
-                rule = st.selectbox("Search Rules",
-                    options=[''] + list(sorted(filtered_options['DisplayName'].unique())))
-                
-                # Split rule into ID and name if selected
-                rule_id = rule.split(']')[0][1:] if rule else None
-                rule_name = rule.split(']')[1].strip() if rule else None
-                
-                outcomes = st.selectbox("Search Outcomes",
-                    options=[''] + list(sorted(filtered_options['Outcome'].dropna().unique())))
-                
-                search_clicked = st.button("Search", type="primary")
+                search_clicked = st.button("Search", type="primary", key="search_button")
+            except Exception as e:
+                st.error(f"Error in filters: {str(e)}")
+                search_clicked = False
+            finally:
+                if 'conn' in locals() and conn:
+                    conn.close()
 
-            if search_clicked:
+    # Main content area for results
+    if st.session_state['authenticated'] and search_clicked:
+        try:
+            conn = get_db_connection(
+                st.session_state['username'],
+                st.session_state['password'],
+                st.session_state['database']
+            )
+            
+            if report_type == "What Triggers What":
                 results_df = pd.read_sql("EXEC dbo.RuleHierarchyReport", conn)
+                
+                rule_id = rule.split(']')[0][1:] if rule else None
                 
                 mask = pd.Series(True, index=results_df.index)
                 
@@ -152,10 +281,10 @@ def main():
                     def truncate_text(text, max_length=30):
                         return text[:max_length] + '...' if len(text) > max_length else text
                     
-                    dashboard_df = get_dashboard_metrics(filtered_df)
+                    dashboard_df = get_dashboard_metrics_triggers(filtered_df)
                     
-                    cols = st.columns(4)
-                    cols[0].metric("Jurisdictions", truncate_text(dashboard_df['Jurisdictions'].iloc[0]))
+                    cols = st.columns([3, 1, 1, 1, 1])
+                    cols[0].metric("Jurisdictions", truncate_text(dashboard_df['Jurisdictions'].iloc[0], max_length=50))
                     cols[1].metric("Matter Types", truncate_text(dashboard_df['MatterTypes'].iloc[0]))
                     cols[2].metric("Actions", int(dashboard_df['Actions'].iloc[0]))
                     cols[3].metric("Tasks", int(dashboard_df['Tasks'].iloc[0]))
@@ -172,21 +301,58 @@ def main():
                         use_container_width=True,
                         height=600
                     )
+            
+            else:  # Release Notes
+                filtered_df = get_release_notes_data(
+                    conn, 
+                    jurisdiction=jurisdiction if jurisdiction != 'All' else None,
+                    matter_type=matter_type if matter_type else None,
+                    from_date=from_date,
+                    to_date=to_date
+                )
+                
+                if filtered_df.empty:
+                    st.write("No results found.")
+                else:
+                    def truncate_text(text, max_length=30):
+                        return text[:max_length] + '...' if len(text) > max_length else text
                     
-                    csv = filtered_df.to_csv(index=False).encode('utf-8')
-                    st.download_button(
-                        label="Export to Excel",
-                        data=csv,
-                        file_name="rule_families.csv",
-                        mime="text/csv"
+                    dashboard_df = get_dashboard_metrics_release(filtered_df, from_date, to_date)
+                    
+                    cols = st.columns([3, 1, 1, 1, 1])
+                    cols[0].metric("Jurisdictions", truncate_text(dashboard_df['Jurisdictions'].iloc[0], max_length=50))
+                    cols[1].metric("From", dashboard_df['From'].iloc[0])
+                    cols[2].metric("To", dashboard_df['To'].iloc[0])
+                    cols[3].metric("Actions", int(dashboard_df['Actions'].iloc[0]))
+                    cols[4].metric("Tasks", int(dashboard_df['Tasks'].iloc[0]))
+
+                    st.markdown('<div class="spacer"></div>', unsafe_allow_html=True)
+                    
+                    st.dataframe(
+                        filtered_df[[
+                            'QA Rule ID', 'Rule ID', 'Rule Name', 'Rule Type', 'Matter Type',
+                            'Country', 'Version Type', 'Calc Code', 'Version Notes',
+                            'Release Version', 'Reference', 'Modified On'
+                        ]],
+                        hide_index=True,
+                        use_container_width=True,
+                        height=600
                     )
+            
+            # Common export functionality
+            csv = filtered_df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="Export to Excel",
+                data=csv,
+                file_name=f"{report_type.lower().replace(' ', '_')}.csv",
+                mime="text/csv"
+            )
 
         except Exception as e:
-            st.error(f"Error: {str(e)}")
+            st.error(f"Error loading results: {str(e)}")
         finally:
-            conn.close()
-    else:
-        st.info("Please enter your database credentials to begin.")
+            if 'conn' in locals() and conn:
+                conn.close()
 
 if __name__ == "__main__":
     main()
